@@ -1,0 +1,81 @@
+# 支付收单知识条目
+# 字段说明见 schemas.py::KnowledgeRule；yaml 顶层为条目数组。
+
+- id: KR-PAY-001
+  domain: 支付收单
+  category: 业务规则
+  subject: 跨境卡手续费率
+  condition: 境外卡组织发行的卡，消费交易
+  rule: 手续费 = 交易金额 × 0.6%，最低 0.10 元，无封顶；结算金额 = 交易金额 - 手续费
+  expected: 结算金额按交易金额扣减手续费后入账，不得倒扣
+  rule_type: formula
+  formula: "fee = max(amount * rate, fee_min); settle = amount - fee"
+  params:
+    rate: 0.006
+    fee_min: 0.10
+  rounding: 四舍五入到分
+  dimensions: [商户, 卡, 币种]
+  domain_attrs:
+    card_org: VISA/MASTER
+    tx_type: 消费
+    settle_cycle: T+1
+    currency: CNY
+  version: "2025.11"
+  effective_from: 2025-11-01
+  regulatory: false
+  source: 收单费率表.xlsx §跨境费率
+  config_snapshot_at: 2025-11-20
+  test_hints:
+    - 金额 0.01 时手续费取保底 0.10，验证是否出现负结算金额
+    - 金额使手续费恰好落在分位边界（如 16.67 元）
+    - 退款时手续费是否退还
+    - 不同卡组织费率是否一致
+
+- id: KR-PAY-002
+  domain: 支付收单
+  category: 业务规则
+  subject: 结算周期与节假日顺延
+  condition: 交易完成并进入待结算队列
+  rule: 默认 T+1 结算；遇法定节假日顺延至下一工作日；T 日以清算时点 23:59:59 划分
+  expected: 结算日资金到账商户结算账户，节假日前交易不得提前或延后结算
+  rule_type: text
+  time_window: 自然日
+  cutoff_time: "23:59:59"
+  dimensions: [商户, 交易]
+  domain_attrs:
+    settle_cycle: T+1
+    holiday_rule: 顺延至下一工作日
+  version: "2025.11"
+  effective_from: 2025-11-01
+  regulatory: false
+  source: 结算管理办法.docx §3.2
+  config_snapshot_at: 2025-11-20
+  test_hints:
+    - 23:59:59 与 00:00:00 的交易归属哪一天
+    - 周五及节前一天交易的到账日
+    - 跨月、跨年结算的归属
+    - 节假日顺延后是否重复结算
+
+- id: KR-PAY-003
+  domain: 支付收单
+  category: 业务规则
+  subject: 分账比例与尾差处理
+  condition: 一笔交易配置多个分账接收方
+  rule: 各接收方分账比例之和必须等于 100%；按比例计算后尾差归入主商户
+  expected: 各分账金额之和等于交易金额，无资金凭空产生或丢失
+  rule_type: formula
+  formula: "share_i = round(amount * ratio_i, 2); main = amount - sum(share_i)"
+  rounding: 四舍五入到分
+  dimensions: [商户]
+  domain_attrs:
+    tx_type: 分账
+  version: "2025.11"
+  effective_from: 2025-11-01
+  regulatory: false
+  source: 分账产品说明.md §4
+  config_snapshot_at: 2025-11-20
+  test_hints:
+    - 比例之和为 99.99% 或 100.01% 时是否拦截
+    - 三方及以上分账尾差归谁
+    - 分账金额为 0 的接收方是否允许
+    - 分账后退款如何冲正

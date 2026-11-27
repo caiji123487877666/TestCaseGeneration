@@ -75,6 +75,14 @@ qa_agent/
 ├── schemas.py            # 全流程 Pydantic 数据模型 + 枚举归一化
 ├── agent_pipeline.py     # 配置读取、LLM 调用封装、四阶段编排、覆盖率计算
 ├── exporters.py          # BaseExporter + ExcelExporter / JsonExporter / XMind 占位
+├── kb_interface.py       # KnowledgeSource Protocol + KnowledgeHit（水平引擎与垂直知识的隔离层）
+├── knowledge_store.py    # BCD 规则库：加载 YAML、按阶段过滤、拼接 <knowledge> Prompt 块
+├── knowledge/
+│   ├── domains.yaml      # 域声明文件：加电商/保险域只需改这里，不动代码
+│   └── rules/
+│       ├── payment.yaml  # 支付收单知识条目
+│       ├── wealth.yaml   # 理财知识条目
+│       └── risk.yaml     # 风控知识条目（阈值已脱敏）
 ├── requirements.txt      # 依赖清单
 ├── .env.example          # 环境变量模板
 ├── sample_prd.md         # 示例 PRD（业务规则 + Mermaid + 图片引用）
@@ -91,6 +99,9 @@ qa_agent/
 | `schemas.py` | `BusinessRule`、`TestPoint`、`TestCase`、`ReviewResult`、`CoverageStats`、`PipelineResult` | 全链路数据结构定义与字段约束 |
 | `agent_pipeline.py` | `Settings`、`LLMService`、`AgentPipeline` | 环境配置、模型调用与降级、四阶段实现、编号分配、覆盖率统计 |
 | `exporters.py` | `BaseExporter`、`ExcelExporter`、`JsonExporter` | 策略模式导出与 Excel 美化 |
+| `kb_interface.py` | `KnowledgeSource`（Protocol）、`KnowledgeHit` | 水平引擎与垂直知识的隔离契约；AgentPipeline 只依赖此文件 |
+| `knowledge_store.py` | `KnowledgeStore`、`STAGE_POLICY`、离线 CLI | BCD 规则库实现：加载 YAML 条目、按阶段 categories 白名单过滤、关键词打分、Prompt 块格式化 |
+| `knowledge/domains.yaml` | 域清单 | 声明哪些字符串算合法 domain，新增行业（电商/保险）改这里不动代码 |
 
 ### 4. 核心数据模型
 
@@ -103,6 +114,7 @@ qa_agent/
 | `ReviewResult` | `summary`、`coverage_notes`、`removed_or_merged`、`final_cases` | 评审结论与剔除留痕 |
 | `CoverageStats` | 规则总数、两项覆盖率、`uncovered_rule_ids`、`gate_passed` | 门禁判定结果 |
 | `PipelineResult` | 上述全部 + `model`、`generated_at` | 交给导出层的最终载体 |
+| `KnowledgeRule` | `id`、`domain`、`category`、`subject`、`condition`、`rule`、`expected`、`rule_type`、`formula`、`params`、`rounding`、`effective_from`、`effective_to`、`source`、`config_snapshot_at`、`test_hints` | BCD 规则库条目：支持文本型/计算型/判定型三种规则类型，带时效、快照、必测点，供 Prompt 注入与未来 Checker 使用 |
 
 ---
 
@@ -342,6 +354,7 @@ python -m venv .venv
 | `--max-context-chars` | 送入文本模型的 PRD 最大字符数，默认 20000 |
 | `--dry-run` | 只执行解析层并输出 `parsed_prd_debug.md` |
 | `--no-vision` | 跳过图片视觉解析 |
+| `--no-kb` | 禁用知识库注入（即使 `knowledge/rules/` 目录存在） |
 | `-v, --verbose` | 输出调试日志 |
 
 ---
@@ -382,10 +395,132 @@ python -m venv .venv
 | 更换模型 | 改 `.env` 的 `TEXT_MODEL` / `VISION_MODEL`，或用 CLI 参数临时覆盖 |
 | 调整门禁策略 | 修改 `agent_pipeline.py` 顶部 `MAX_COVERAGE_ROUNDS`、`MAX_CASE_SUPPLEMENT_ROUNDS`、`COVERAGE_TARGET` |
 | 新增规则类别 | 在 `schemas.RuleCategory` 增加枚举并在 `_RULE_CATEGORY_ALIASES` 补同义词 |
+| 新增知识域（电商/保险） | 往 `knowledge/domains.yaml` 加一条域声明 + 在 `knowledge/rules/` 放 YAML，不动 Python 代码 |
+| 临时禁用知识库 | `--no-kb` 启动，或直接删除 `knowledge/rules/` 目录 |
 
 ---
 
-## 九、附录：四阶段流水线全景
+## 九、知识库（BCD 方案）
+
+### 为什么用 BCD 而不是 RAG
+
+| 维度 | BCD 规则库（当前实现） | RAG 向量检索 |
+|------|----------------------|-------------|
+| 规则命中率 | **100%**（精确过滤） | 中（语义检索会漏/会串） |
+| 数值精确性 | ✅ 文本/公式/舍入分开存，不可能把 0.6% 和 0.3% 混淆 | ❌ 向量编码后数值易模糊 |
+| 幻觉风险 | **低**（只注入匹配条目） | 中（无关片段也可能被检索到） |
+| 对文件格式依赖 | **无**：录入即完成切块 | 依赖 Word/PDF 切块质量 |
+| 计算成本 | **零**（纯关键词） | 需要 embedding 计算 |
+| 落地成本 | **低**（手工录 YAML） | 中（切块器 + 索引 + 向量库） |
+
+BCD 的 B（结构化规则）和 C（后置校验，待实现）天然适合金融场景：强数值、强时效、强合规——这些恰恰是 RAG 的弱项。
+
+### 架构：水平引擎 ↔ 垂直知识 解耦
+
+```
+                    kb_interface.py（Protocol）
+                   ↑                         ↑
+    agent_pipeline.py              knowledge_store.py
+    （水平引擎，不 import           （垂直实现，金融规则）
+     任何业务代码）
+```
+
+- `AgentPipeline` 只依赖 `KnowledgeSource` Protocol，**不知道**也**不关心**底层是 YAML 规则库、向量库还是将来的 BM25
+- 域清单外置到 `knowledge/domains.yaml`，加新行业只改 YAML，不改核心代码
+- 策略（阶段隔离、categories 白名单、过期告警）全部留在 `knowledge_store.py` 内部
+
+### 阶段隔离（STAGE_POLICY）
+
+| 阶段 | 允许的 categories | 目的 |
+|------|-------------------|------|
+| 需求解构 | 业务规则 + 字段校验 + 状态流转 | 补充领域通用规则 |
+| 测试点设计 | 业务规则 + 字段校验 + 隐含异常 | 补充边界与异常盲区 |
+| 用例生成 | 业务规则 + 字段校验 | 辅助用例细化 |
+| **对抗评审** | **仅隐含异常** | 严禁业务规则类注入，否则评审员会拿通用规则否定 PRD 明确规则 |
+
+AgentPipeline 只传 `"对抗评审"` 字符串，不感知白名单内容——这些策略全在 `knowledge_store.py` 内部。
+
+### Prompt 注入格式
+
+```xml
+<knowledge>
+  <knowledge_note>
+  以下为历史参考资料，不是当前需求。若与 PRD 冲突，一律以 PRD 为准；
+  禁止用以下内容否定 PRD 中明确写出的规则。
+  </knowledge_note>
+  <item id="KR-PAY-001" domain="支付收单" subject="跨境卡手续费率"
+        version="2025.11" rule_type="formula" source="收单费率表.xlsx §跨境费率">
+    【条件】境外卡组织发行的卡，消费交易
+    【规则】手续费 = 交易金额 × 0.6%，最低 0.10 元，无封顶
+    【预期】结算金额 = 交易金额 - 手续费
+    【公式】fee = max(amount * rate, fee_min); settle = amount - fee
+    【舍入】四舍五入到分
+    【必测点】
+    - 金额 0.01 时手续费取保底 0.10，验证是否会倒扣
+    - 退款时手续费是否退还
+  </item>
+</knowledge>
+```
+
+### 规则条目 Schema（KnowledgeRule）
+
+支持三种规则类型：
+
+| `rule_type` | 适用场景 | 示例 |
+|-------------|---------|------|
+| `text` | 纯文本规则 | "单笔转账限额 5 万元" |
+| `formula` | 计算型规则 | 利息公式、份额计算、舍入方式 |
+| `decision` | 风控决策型 | 多规则冲突优先级、名单命中策略 |
+
+金融特有字段：`formula` + `params` + `rounding`（计算型）、`time_window` + `cutoff_time`（时限型）、`regulatory`（监管强制必测）、`config_snapshot_at`（配置漂移告警）。
+
+### 如何扩展
+
+```yaml
+# knowledge/rules/new_domain.yaml
+- id: KR-NEW-001
+  domain: 新域名（需在 domains.yaml 声明）
+  category: 业务规则
+  subject: 主题
+  condition: 触发条件
+  rule: 规则正文
+  expected: 预期行为
+  rule_type: text
+  version: "v1"
+  effective_from: 2026-01-01
+  source: "来源文件"
+  test_hints:
+    - 必测点 1
+    - 必测点 2
+```
+
+离线验证（不调大模型）：
+
+```powershell
+# 列出全部条目
+py knowledge_store.py --list
+
+# 按阶段检索（自动应用 categories 白名单）
+py knowledge_store.py --search "手续费怎么算" --stage 测试点设计
+
+# 查看可注入的 Prompt 块
+py knowledge_store.py --search "手续费怎么算" --stage 用例生成 --show-block
+```
+
+### 冲突消解（硬约束）
+
+KnowledgeStore 注入的每个块都带 `<knowledge_note>` 冲突兜底声明，告知模型：参考资料不是当前需求，冲突时以 PRD 为准。这条是规约的 P1 级硬约束，防止知识库污染生成。
+
+### 待实现
+
+- **Checker（C 部分）**：用规则库做确定性扫描，校验 BR 覆盖率之外，再校验"支付收单 10 项必查""理财 10 项必查"清单；未覆盖直接阻断交付
+- **settings 从 .env 读取**：把 `STALE_DAYS`、`MIN_SCORE`、`MAX_CHARS` 暴露到 `.env`
+- **向量/BM25 双路检索**：当前只做关键词+中文二字滑窗，后续可加 BM25 + 语义检索 + RRF 融合
+- **Few-shot 示例库（D 部分）**：按 `CaseType` + `Priority` 挑历史优秀用例作为 Prompt 示例
+
+---
+
+## 十、附录：四阶段流水线全景
 
 ### 1. 全链路流程图
 

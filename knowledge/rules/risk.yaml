@@ -1,0 +1,72 @@
+# 风控知识条目
+# 注意：具体阈值属于敏感信息，统一用 <REDACTED> 占位，只保留检查项与决策顺序。
+
+- id: KR-RSK-001
+  domain: 风控
+  category: 业务规则
+  subject: 多规则命中时的决策优先级
+  condition: 同一笔交易同时命中多条风控规则
+  rule: 按规则优先级数值从高到低依次评估，命中即产出决策并停止后续评估
+  expected: 高优先级拦截优先于低优先级放行，不得出现低优先级覆盖高优先级
+  rule_type: decision
+  dimensions: [交易]
+  domain_attrs:
+    priority_rule: 数值越小优先级越高
+    decision_order: 拒绝 > 人工审核 > 挑战 > 通过
+  version: "2025.11"
+  effective_from: 2025-11-15
+  regulatory: true
+  source: 风控规则引擎设计.md §决策顺序
+  test_hints:
+    - 同时命中拒绝与通过规则，验证取拒绝
+    - 同优先级两条规则冲突时的兜底策略
+    - 规则变更生效瞬间的在途交易归属
+    - 决策结果是否可追溯命中规则编号
+
+- id: KR-RSK-002
+  domain: 风控
+  category: 业务规则
+  subject: 频次窗口限流
+  condition: 同一维度在滚动窗口内累计交易
+  rule: 按滚动窗口统计交易次数，达到阈值后按决策动作处理；窗口按滑动方式计算，不随自然日重置
+  expected: 窗口内第 N 次放行，第 N+1 次触发决策动作
+  rule_type: decision
+  time_window: 滚动24h
+  dimensions: [设备, IP, 卡]
+  domain_attrs:
+    window_seconds: 86400
+    threshold: "<REDACTED>"
+    decision: 挑战
+  version: "2025.11"
+  effective_from: 2025-11-15
+  regulatory: false
+  source: 风控策略配置.md §频次规则
+  test_hints:
+    - 第 N 次与第 N+1 次的边界
+    - 滚动窗口与自然日重置的差异（23:59 与 00:01 连续两笔）
+    - 同一维度与多维度组合的计数方式
+    - 重复请求是否重复计数
+
+- id: KR-RSK-003
+  domain: 风控
+  category: 字段校验
+  subject: 名单匹配规则
+  condition: 交易请求中的主体信息与名单库比对
+  rule: 按名单类型选择匹配方式（精确/模糊/证件号掩码），匹配前统一大小写、全半角与首尾空格
+  expected: 命中名单按名单决策执行，未命中继续评估其他规则
+  rule_type: decision
+  dimensions: [证件号, 手机号, 银行卡号]
+  domain_attrs:
+    list_type: 黑名单/灰名单/白名单
+    match_mode: 精确
+    normalization: 大小写归一/全半角归一/去首尾空格
+  version: "2025.11"
+  effective_from: 2025-11-15
+  regulatory: true
+  source: 名单管理规范.md §2
+  test_hints:
+    - 精确与模糊匹配的判定差异
+    - 证件号大小写、全半角、空格变体
+    - 名单加入与移除后的生效延迟
+    - 同时在黑白名单时的优先级
+    - 空值与历史数据缺失的处理

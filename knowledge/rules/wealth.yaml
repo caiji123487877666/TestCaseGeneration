@@ -1,0 +1,86 @@
+# 理财知识条目
+
+- id: KR-WM-001
+  domain: 理财
+  category: 业务规则
+  subject: 申购份额计算与确认日
+  condition: 用户提交申购申请
+  rule: 15:00 前申请当日为 T 日，15:00 后顺延至下一交易日；份额 =（金额 - 申购费）/ T 日净值，保留 2 位小数
+  expected: T+1 确认份额，确认后可查询持仓，T+2 可赎回
+  rule_type: formula
+  formula: "shares = floor((amount - fee) / nav, 2)"
+  params:
+    purchase_min: 1.00
+    increment: 0.01
+  rounding: 份额截位到 2 位小数
+  time_window: 交易日
+  cutoff_time: "15:00:00"
+  dimensions: [用户, 产品]
+  domain_attrs:
+    product_type: 货币基金
+    nav_precision: 4
+    confirm_day: T+1
+  version: "2025.10"
+  effective_from: 2025-10-01
+  regulatory: false
+  source: 理财产品要素表.xlsx §申购规则
+  config_snapshot_at: 2025-10-15
+  test_hints:
+    - 14:59:59 / 15:00:00 / 15:00:01 三个时点的 T 日归属
+    - 周五 15:00 后申请，份额确认日是否跳过周末
+    - 春节长假期间申请的顺延逻辑
+    - 份额尾差处理（截位与四舍五入的差异）
+
+- id: KR-WM-002
+  domain: 理财
+  category: 业务规则
+  subject: 赎回费阶梯与持有期计算
+  condition: 用户提交赎回申请
+  rule: 赎回费按持有期阶梯收取，持有不满 7 天收取 1.5%，7 至 30 天收取 0.5%，30 天以上免收
+  expected: 赎回金额 = 份额 × 净值 ×（1 - 赎回费率），扣除费用后到账
+  rule_type: formula
+  formula: "cash = shares * nav * (1 - fee_rate); holding_days = redeem_date - confirm_date"
+  rounding: 四舍五入到分
+  time_window: 交易日
+  dimensions: [用户, 产品]
+  domain_attrs:
+    redeem_fee_ladder:
+      - [0, 6, 0.015]
+      - [7, 29, 0.005]
+      - [30, null, 0]
+  version: "2025.10"
+  effective_from: 2025-10-01
+  regulatory: false
+  source: 理财产品要素表.xlsx §赎回规则
+  config_snapshot_at: 2025-10-15
+  test_hints:
+    - 持有期 6/7/29/30 天四个边界
+    - 持有期是否含确认日当天
+    - 部分赎回时持有期如何界定
+    - 赎回费是否影响剩余份额成本
+
+- id: KR-WM-003
+  domain: 理财
+  category: 业务规则
+  subject: 快速赎回限额
+  condition: 用户使用快速赎回通道
+  rule: 单个用户单自然日快速赎回上限 1 万元，且单日不超过 5 笔；超出部分需走普通赎回
+  expected: 超额请求被拦截并提示切换普通赎回，已赎回部分实时到账
+  rule_type: text
+  time_window: 自然日
+  dimensions: [用户, 产品]
+  domain_attrs:
+    fast_redeem_limit: 10000
+    fast_redeem_count: 5
+    arrival: 实时
+  version: "2025.10"
+  effective_from: 2025-10-01
+  regulatory: true
+  source: 现金管理产品规则.md §5
+  config_snapshot_at: 2025-10-15
+  test_hints:
+    - 单笔 9999.99 / 10000.00 / 10000.01 边界
+    - 第 5 笔与第 6 笔
+    - 跨零点额度重置
+    - 普通赎回与快速赎回额度是否共享
+    - 节假日快速赎回是否可用

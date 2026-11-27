@@ -1,0 +1,9 @@
+# 知识域声明文件
+# 作用：把"哪些字符串算一个合法 domain"从代码里移出来，新增行业只需加一个条目
+# 用法：KnowledgeStore.from_dir() 加载 rules/ 时，同时加载本文件校验条目 domain 字段
+
+finance:
+  name: 金融
+  domains: [支付收单, 理财, 风控]
+  # 默认允许的 category（条目未声明时的兜底）
+  default_categories: [业务规则, 字段校验, 状态流转, 隐含异常]

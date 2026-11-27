@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from dotenv import load_dotenv
+from kb_interface import KnowledgeSource
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
@@ -30,6 +31,8 @@ from schemas import (
     BusinessRule,
     BusinessRuleDraft,
     CaseType,
+    ClarificationQuestion,
+    ClarificationResult,
     CoverageStats,
     ImageExtraction,
     ImageKind,
@@ -39,6 +42,7 @@ from schemas import (
     RequirementAnalysis,
     ReviewResult,
     RuleCategory,
+    SupplementRule,
     TestCase,
     TestCaseDraft,
     TestCaseList,
@@ -185,6 +189,39 @@ REVIEW_SYSTEM = """你是独立的对抗评审专家，立场与用例生成者�
 - 对补充 / 修改的用例写清 rule_ids；
 - 在 coverage_notes 中指出仍存在的风险与建议人工补充的场景，特别是空数据与并发场景的覆盖结论。"""
 
+
+
+# ============================== 交互式疑点澄清 ==============================
+
+CLARIFICATION_SYSTEM = """你是资深需求评审专家，请反向审阅 PRD，找出所有模糊、缺漏或可能存在歧义的地方。
+
+评审清单（以下各项都要主动检查）：
+1. 字段校验：必填？长度上限？格式？默认值？空值/null 时怎么处理？
+2. 状态流转：触发事件的精确时点（"下单成功"还是"支付成功"）？回退路径？超时？
+3. 业务规则：数值边界（限购 10 件，那 11 件呢？）？例外条件？优先级冲突怎么解？
+4. 并发与幂等：同一操作 1 秒内重复提交？多端同时改？请求 ID 在哪里传？
+5. 权限与角色：谁能做？谁不能做？做了之后别人还能看到吗？
+6. 异常与降级：依赖服务挂了？网络超时？库存变 0 了？数据不一致时怎么回滚？
+7. 性能与容量：时间上限？数据量上限？响应时间要求？
+
+额外检查（自由发散）：
+- 规则之间是否矛盾？A 说"会员 8 折"，B 说"优惠券叠加"，那会员 + 优惠券能一起用吗？
+- 边界条件有没有覆盖（0 / 负数 / 空串 / 超长 / None / 特殊字符）？
+- 有没有隐含的时序依赖（必须先做 A 才能做 B，但 PRD 没写清）？
+
+要求：
+- 每条问题必须绑定至少一个 BR 编号，让用户知道这条问题质疑的是哪条规则；
+- question 要能被直接回答，不要写"请确认 XX"这种废话，要写清楚你发现的矛盾点或缺失点；
+- 问题数量 5-10 个，覆盖不同 category；
+- summary 简短总结你对 PRD 完整度的整体判断。"""
+
+SYNTHESIZE_SUPPLEMENT_SYSTEM = """你是需求整理专家。根据下面的 PRD 原文和用户对问题的回答，把回答整理成结构化的补充规则。
+
+要求：
+1. 每条补充规则对应一个用户回答，内容必须是明确的、可直接用来设计测试点的业务规则（像 BR 那样写）；
+2. category 根据内容自动判断（字段校验 / 状态流转 / 业务规则 / 隐含异常）；
+3. 不要重复 PRD 里已经明确写过的规则，只写用户回答新增或修正的部分；
+4. 输出数量 5-10 条；如果某个回答是"无特殊要求"或"按默认处理"，可以忽略那条。"""
 
 # ============================== 视觉模型专用 Prompt ==============================
 # 按图片类型分流：流程图类重点抓判断条件 / Yes-No 分支 / 异常回退；
@@ -393,10 +430,12 @@ class AgentPipeline:
         *,
         batch_size: int = 10,
         max_context_chars: int = 20000,
+        kb: KnowledgeSource | None = None,
     ) -> None:
         self.llm = llm
         self.batch_size = batch_size
         self.max_context_chars = max_context_chars
+        self.kb = kb  # 可选知识检索源，None 即不启用知识库
 
     def run(
         self,
@@ -404,19 +443,50 @@ class AgentPipeline:
         *,
         artifact_dir: Path | None = None,
         on_stage: StageCallback | None = None,
+        supplement_rules: list[SupplementRule] | None = None,
+        existing_rules: list[BusinessRule] | None = None,
     ) -> PipelineResult:
         """执行四阶段流水线，返回包含用例与覆盖率统计的最终结果。
 
-        artifact_dir 不为空时，每阶段产物都会落盘，便于中途失败排查与人工核对。
-        on_stage 用于向 CLI 输出阶段进度。
+        supplement_rules 由交互式问答阶段传入；若存在，会在阶段 2 之前
+        合并进规则库并补编号（BR-S01、BR-S02…），参与后续所有覆盖率计算。
+
+        existing_rules 用于交互式模式：若已在外部完成阶段 1 解构，直接传入
+        可避免重复调用模型。若同时存在 supplement_rules，则两者合并后再继续。
         """
         context = document.to_context(self.max_context_chars)
         if artifact_dir is not None:
             artifact_dir.mkdir(parents=True, exist_ok=True)
 
         # ---------- 阶段 1：需求极尽详细解构 ----------
-        _notify(on_stage, *STAGES[0])
-        analysis_summary, rules = self._analyze_document(document)
+        # 如果外部已解构完成（交互式模式），直接复用，避免重复 API 调用
+        if existing_rules is not None:
+            analysis_summary = "（已在外部交互式问答阶段完成解构）"
+            rules = list(existing_rules)
+            logger.info("复用已解构的业务规则 %d 条", len(rules))
+        else:
+            _notify(on_stage, *STAGES[0])
+            analysis_summary, rules = self._analyze_document(document)
+
+        # 如果有交互式补充规则，追加到规则库末尾并编 S 前缀号
+        if supplement_rules:
+            supplement_business_rules = [
+                BusinessRule(
+                    id=f"BR-S{idx:02d}",
+                    category=s.category,
+                    content=s.content,
+                    source=s.source,
+                )
+                for idx, s in enumerate(supplement_rules, start=1)
+            ]
+            rules.extend(supplement_business_rules)
+            logger.info(
+                "合并补充规则 %d 条（BR-S01 ~ BR-S%02d）",
+                len(supplement_business_rules),
+                len(supplement_business_rules),
+            )
+            analysis_summary += f"\n\n（已合并用户补充规则 {len(supplement_business_rules)} 条）"
+
         _save(
             artifact_dir,
             "01_analysis.json",
@@ -487,6 +557,7 @@ class AgentPipeline:
                     user=user,
                     schema=RequirementAnalysis,
                     stage=stage,
+                    kb_query=chunk[:400],  # 用分段前 400 字检索领域通用规则
                 )
             except ValidationError as exc:
                 logger.warning("[%s] 输出无法解析（可能被截断），使用压缩提示重试：%s", stage, exc)
@@ -535,6 +606,7 @@ class AgentPipeline:
                 ),
                 schema=TestPointList,
                 stage=f"{STAGES[1][1]}-规则批次{index}/{len(rule_batches)}",
+                kb_query=" ".join(r.content for r in batch)[:500],
             )
             drafts.extend(_sanitize_point_rule_ids(result.test_points, rule_ids))
         drafts = _dedupe_points(drafts)
@@ -611,6 +683,7 @@ class AgentPipeline:
                 ),
                 schema=TestCaseList,
                 stage=f"{STAGES[2][1]}-批次{batch_index}",
+                kb_query=" ".join(p.title for p in batch)[:400],
             )
             valid_point_ids = {point.id for point in batch}
             for draft in result.test_cases:
@@ -668,6 +741,7 @@ class AgentPipeline:
                 ),
                 schema=ReviewResult,
                 stage=f"{STAGES[3][1]}-批次{index}/{len(case_batches)}",
+                kb_query=" ".join(c.title for c in batch) + " 常见遗漏 边界异常 并发幂等",
             )
             reviews.append(review_batch)
             final_drafts.extend(review_batch.final_cases or batch)
@@ -741,6 +815,76 @@ class AgentPipeline:
 
         return review, _renumber_cases(final_cases)
 
+    # ---------- 交互式：疑点澄清 ----------
+
+    def ask_clarifications(
+        self,
+        document: ParsedDocument,
+        rules: list[BusinessRule],
+        *,
+        extra_checklist: str = "",
+    ) -> ClarificationResult:
+        """反向审阅 PRD + 已解构的 BR，找出模糊点作为疑点。
+
+        额外 checklist 会追加到评审清单末尾，方便用户针对特定领域加强检查。
+        """
+        # 构造提示：PRD 正文 + 完整规则 + 用户额外 checklist
+        rule_list = _format_rules(rules)
+        checklist_block = ""
+        if extra_checklist.strip():
+            checklist_block = f"\n\n用户额外要求重点检查：\n{extra_checklist.strip()}"
+
+        user_prompt = (
+            f"<prd>\n{document.to_context(max_chars=12000)}\n</prd>\n\n"
+            f"<已解构的业务规则>\n{rule_list}\n</已解构的业务规则>"
+            f"{checklist_block}\n\n"
+            "请按上述评审清单自由发问，每条问题绑定具体 BR 编号。"
+        )
+
+        return self._call(
+            system=CLARIFICATION_SYSTEM,
+            user=user_prompt,
+            schema=ClarificationResult,
+            stage="交互式-疑点生成",
+        )
+
+    def synthesize_supplements(
+        self,
+        document: ParsedDocument,
+        rules: list[BusinessRule],
+        qa_pairs: list[tuple[ClarificationQuestion, str]],
+    ) -> list[SupplementRule]:
+        """把用户对疑点的回答整理成结构化补充规则，供后续阶段合并。"""
+        qa_blocks = []
+        for question, answer in qa_pairs:
+            qa_blocks.append(
+                f"【问题 {question.id} · {question.category}】\n"
+                f"质疑规则：{', '.join(question.target_rule_ids)}\n"
+                f"AI：{question.question}\n"
+                f"用户回答：{answer}"
+            )
+        qa_text = "\n\n".join(qa_blocks)
+
+        user_prompt = (
+            f"<prd>\n{document.to_context(max_chars=12000)}\n</prd>\n\n"
+            f"<已有业务规则>\n{_format_rules(rules)}\n</已有业务规则>\n\n"
+            f"<用户对疑点的回答>\n{qa_text}\n</用户对疑点的回答>\n\n"
+            "请把有实质内容的回答整理成补充规则（SupplementRule 列表）。"
+        )
+
+        # 补充规则可能为空（用户全部跳过），需容错
+        try:
+            raw = self.llm.structured(
+                system=SYNTHESIZE_SUPPLEMENT_SYSTEM,
+                user=user_prompt,
+                schema=_SupplementRuleList,
+                stage="交互式-补充规则合成",
+            )
+            return raw.supplement_rules
+        except Exception as exc:
+            logger.warning("补充规则合成失败：%s；将跳过补充", exc)
+            return []
+
     def _call(
         self,
         *,
@@ -748,10 +892,34 @@ class AgentPipeline:
         user: str,
         schema: type[SchemaT],
         stage: str,
+        kb_query: str | None = None,
     ) -> SchemaT:
-        """统一的模型调用包装：记录阶段名与耗时，便于定位慢请求。"""
+        """统一的模型调用包装：记录阶段名与耗时，可选注入知识库。
+
+        kb_query 非空且 self.kb 存在时，触发知识检索并把 <knowledge> 块拼到 user 前面。
+        检索异常被静默降级为无知识，不阻断主流程。
+        """
+        effective_user = user
+        hits = []
+        if self.kb is not None and kb_query:
+            try:
+                stage_key = stage.split("-")[0].strip()
+                hits = self.kb.search(kb_query, stage=stage_key)
+                if hits:
+                    block = self.kb.format_block(hits, max_chars=4000)
+                    if block:
+                        effective_user = block + "\n\n" + user
+                        logger.info(
+                            "[%s] 知识库注入 %d 条：%s",
+                            stage,
+                            len(hits),
+                            ", ".join(h.source_id for h in hits),
+                        )
+            except Exception:  # 知识库异常不阻断主流程
+                logger.warning("[%s] 知识库检索异常，已跳过", stage, exc_info=True)
+
         started = time.monotonic()
-        result = self.llm.structured(system=system, user=user, schema=schema, stage=stage)
+        result = self.llm.structured(system=system, user=effective_user, schema=schema, stage=stage)
         logger.info("[%s] 完成，用时 %.1fs", stage, time.monotonic() - started)
         return result
 

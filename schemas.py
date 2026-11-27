@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, Field
 
@@ -187,6 +188,40 @@ class RequirementAnalysis(BaseModel):
     rules: list[BusinessRuleDraft] = Field(description="原子级业务规则、状态流转、字段校验与隐含异常")
 
 
+# ---------- 交互式：疑点澄清 ----------
+
+
+class ClarificationQuestion(BaseModel):
+    """AI 发现的单个疑点。必须绑定具体 BR 编号，让用户知道这条问题针对哪条规则。"""
+
+    id: str = Field(description="问题编号，如 CQ-01")
+    target_rule_ids: list[str] = Field(description="这条问题质疑的 BR 编号（可多条）")
+    category: str = Field(description="疑点类型：字段校验/状态流转/触发时机/并发/权限/其他")
+    question: str = Field(description="给用户的具体问题，要能直接回答")
+    context: str = Field(default="", description="帮用户理解问题的规则原文片段或章节标题")
+
+
+class ClarificationResult(BaseModel):
+    """AI 产出的疑点列表。"""
+
+    summary: str = Field(description="AI 对 PRD 模糊点的总体评审意见")
+    questions: list[ClarificationQuestion] = Field(description="逐条疑点")
+
+
+class SupplementRule(BaseModel):
+    """用户回答后合成的补充规则，与 BusinessRule 结构相同，只是来源不同。"""
+
+    category: _RuleCategoryField
+    content: str = Field(description="补充后的明确规则内容")
+    source: str = Field(default="用户澄清", description="标记来自用户回答，便于追溯")
+
+
+class _SupplementRuleList(BaseModel):
+    """辅助：让模型以列表形式返回 SupplementRule。"""
+
+    supplement_rules: list[SupplementRule]
+
+
 # ---------- Step 3：测试点 ----------
 
 
@@ -286,3 +321,49 @@ class PipelineResult(BaseModel):
     coverage: CoverageStats | None = None
     model: str = ""
     generated_at: str = ""
+
+
+# ---------- 知识库 ----------
+
+
+class KnowledgeRule(BaseModel):
+    """金融知识条目：归一化后的最小可检索单元。
+
+    知识以结构化条目而非原始文档存储，检索是确定性的（域过滤 + 生效期过滤 + 关键词打分），
+    不依赖向量与分词，便于离线核对与回归。
+    """
+
+    id: str = Field(description="唯一编号，如 KR-PAY-001")
+    domain: str = Field(description="所属知识域，取值由 knowledge/domains.yaml 声明")
+    category: RuleCategory = Field(description="复用业务规则分类，用于阶段隔离检索")
+    subject: str = Field(description="检索主题键，如“跨境手续费率”")
+    condition: str = Field(description="规则触发条件")
+    rule: str = Field(description="规则正文")
+    expected: str = Field(description="预期行为")
+    rule_type: Literal["text", "formula", "decision"] = Field(
+        default="text", description="规则形态：文本/计算/判定"
+    )
+
+    # 计算型规则专用
+    formula: str | None = Field(default=None, description="计算表达式，如 fee = max(amount * rate, fee_min)")
+    params: dict[str, Any] = Field(default_factory=dict, description="公式参数，如 rate=0.006")
+    rounding: str | None = Field(default=None, description="舍入方式，如“四舍五入到分”")
+
+    # 时间与限额（三域通用）
+    time_window: str | None = Field(default=None, description="单笔/自然日/滚动24h")
+    cutoff_time: str | None = Field(default=None, description="日切时点，如 15:00:00")
+    dimensions: list[str] = Field(default_factory=list, description="限额或统计维度，如商户/卡/设备")
+
+    # 治理字段
+    version: str = Field(description="知识版本号")
+    effective_from: date = Field(description="生效起始日")
+    effective_to: date | None = Field(default=None, description="失效日，None 表示长期有效")
+    regulatory: bool = Field(default=False, description="是否监管强制必测项")
+    confidence: Literal["high", "medium", "low"] = Field(default="high", description="知识可信度")
+    source: str = Field(description="来源文件与章节，用于追溯")
+    config_snapshot_at: date | None = Field(
+        default=None, description="配置快照日期，用于识别线上配置漂移"
+    )
+
+    domain_attrs: dict[str, Any] = Field(default_factory=dict, description="域特有属性")
+    test_hints: list[str] = Field(default_factory=list, description="必测点，供校验器使用")

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agent_pipeline import AgentPipeline, LLMService, Settings
 from exporters import get_exporter
+from knowledge_store import KnowledgeStore
 from parser import PRDParser
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过图片视觉解析（文本模型不支持多模态时使用）",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="交互式模式：先列出 PRD 模糊点让你确认，再根据回答补充规则后生成用例",
+    )
+    parser.add_argument(
+        "--checklist",
+        type=str,
+        default=None,
+        help="交互式模式下额外要求重点检查的要点（用 ; 或换行分隔）",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
+    parser.add_argument("--no-kb", action="store_true", help="跳过知识库，即使 knowledge/rules 目录存在")
     return parser
 
 
@@ -111,16 +124,45 @@ def main(argv: list[str] | None = None) -> int:
 
     assert llm is not None
 
-    # ---------- Step 2-4：四阶段流水线 ----------
+    # 初始化知识库（可选，--no-kb 或目录不存在时跳过）
+    kb = None
+    if not args.no_kb:
+        try:
+            kb = KnowledgeStore.from_dir()
+            print(kb.describe())
+            for warning in kb.warnings:
+                print(f"  ! {warning}")
+        except Exception as exc:
+            print(f"知识库加载失败（将跳过）：{exc}", file=sys.stderr)
+            kb = None
+    else:
+        print("知识库：已通过 --no-kb 禁用")
+
     pipeline = AgentPipeline(
         llm,
         batch_size=args.batch_size,
         max_context_chars=args.max_context_chars,
+        kb=kb,
     )
+
+    # ---------- 交互式：疑点澄清 ----------
+    supplement_rules = None
+    existing_rules = None
+    if args.interactive:
+        supplement_rules, existing_rules = _run_interactive_clarification(
+            pipeline=pipeline,
+            document=document,
+            run_dir=run_dir,
+            extra_checklist=args.checklist,
+        )
+
+    # ---------- Step 2-4：四阶段流水线 ----------
     result = pipeline.run(
         document,
         artifact_dir=run_dir / "stages",
         on_stage=lambda index, name: print(f"\n>>> 阶段 {index}/4：{name}"),
+        supplement_rules=supplement_rules,
+        existing_rules=existing_rules,
     )
 
     # ---------- Step 5：策略导出 ----------
@@ -141,6 +183,100 @@ def main(argv: list[str] | None = None) -> int:
     print(f"导出文件：{output_path}")
     print(f"阶段产物：{run_dir / 'stages'}")
     return 0
+
+
+def _run_interactive_clarification(
+    *,
+    pipeline: AgentPipeline,
+    document,
+    run_dir: Path,
+    extra_checklist: str | None,
+) -> tuple[list | None, list]:
+    """交互式问答：解构 PRD → 生成疑点 → 用户回答 → 合成补充规则。
+
+    返回 (supplement_rules, existing_rules)，后者用于后续 pipeline.run() 避免重复解构。
+    """
+    import json as _json
+
+    print("\n" + "=" * 60)
+    print("【交互式模式】Step 0 解构 PRD，准备向你确认疑点...")
+    print("=" * 60)
+
+    # 先解构 PRD 拿到规则（只做一次，后续复用避免重复 API）
+    analysis_summary, rules = pipeline._analyze_document(document)
+    print(f"已解构 {len(rules)} 条业务规则")
+    if extra_checklist:
+        print(f"用户额外要求重点检查：{extra_checklist}")
+
+    # 保存解构产物便于核对
+    (run_dir / "stages").mkdir(parents=True, exist_ok=True)
+    (run_dir / "stages" / "01_analysis_interactive.json").write_text(
+        _json.dumps({"summary": analysis_summary, "rules": [r.model_dump() for r in rules]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 生成疑点
+    print("\nAI 正在审阅 PRD 并提出疑问...")
+    clarification = pipeline.ask_clarifications(
+        document, rules, extra_checklist=extra_checklist or ""
+    )
+
+    # 保存疑点列表
+    (run_dir / "stages" / "01b_clarification_questions.json").write_text(
+        _json.dumps(clarification.model_dump(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"\nAI 评审总结：{clarification.summary}")
+    print(f"\n发现 {len(clarification.questions)} 个需要你确认的问题。")
+    print("对每个问题直接回车表示跳过；输入 'done' 提前结束问答。")
+    print("-" * 60)
+
+    qa_pairs: list = []
+    for idx, q in enumerate(clarification.questions, start=1):
+        print(f"\n【问题 {idx}/{len(clarification.questions)}】{q.id} · {q.category}")
+        print(f"  质疑规则：{', '.join(q.target_rule_ids)}")
+        if q.context:
+            print(f"  规则片段：{q.context}")
+        print(f"  AI：{q.question}")
+        try:
+            answer = input("  你的回答：").strip()
+        except EOFError:
+            print("  (无输入，跳过)")
+            answer = ""
+
+        if answer.lower() == "done":
+            print("\n收到 'done'，提前结束问答。")
+            break
+        if answer:
+            qa_pairs.append((q, answer))
+        else:
+            print("  (跳过)")
+
+    print("-" * 60)
+    print(f"共收集到 {len(qa_pairs)} 条有效回答，正在合成补充规则...")
+
+    supplement_rules = None
+    if qa_pairs:
+        supplement_rules = pipeline.synthesize_supplements(document, rules, qa_pairs)
+        if supplement_rules:
+            print(f"合成补充规则 {len(supplement_rules)} 条：")
+            for i, sr in enumerate(supplement_rules, start=1):
+                print(f"  BR-S{i:02d} [{sr.category}] {sr.content}")
+            (run_dir / "stages" / "01c_supplement_rules.json").write_text(
+                _json.dumps([sr.model_dump() for sr in supplement_rules], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            print("（用户回答未形成新规则，将跳过补充）")
+    else:
+        print("（没有有效回答，将只用原 PRD 继续生成）")
+
+    print("\n" + "=" * 60)
+    print("交互式问答结束，进入正式流水线。")
+    print("=" * 60)
+
+    return supplement_rules, rules
 
 
 if __name__ == "__main__":
